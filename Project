@@ -1,0 +1,170 @@
+import numpy as np, pandas as pd, torch, random, math, time
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
+def generate_multivariate_series(n_steps=2500):
+    t = np.arange(n_steps)
+    trend = 0.0008 * (t**1.5)
+    daily = 2*np.sin(2*np.pi*t/24)
+    weekly = 1.5*np.sin(2*np.pi*t/168)
+    amp = 1 + 0.5*np.sin(2*np.pi*t/(168*5))
+    y = amp*(daily + weekly) + trend + 0.2*np.random.randn(n_steps)
+    temp = 10 + 5*np.sin(2*np.pi*t/24 + 0.4) + np.random.randn(n_steps)*0.5
+    event = np.zeros(n_steps)
+    spikes = np.random.choice(range(100, n_steps-50), n_steps//200)
+    for s in spikes: event[s:s+3] = 1
+    df = pd.DataFrame({"y":y,"temp":temp,"event":event},
+                      index=pd.date_range("2015-01-01", periods=n_steps, freq="H"))
+    return df
+
+df = generate_multivariate_series()
+
+df = df.ffill().bfill()
+df["y_diff"] = df["y"].diff().fillna(0)
+
+scaler = StandardScaler()
+scaled = scaler.fit_transform(df.values)
+
+SEQ_LEN = 72
+HORIZON = 24
+
+def create_sequences(data):
+    X,Y=[],[]
+    for i in range(len(data)-SEQ_LEN-HORIZON+1):
+        X.append(data[i:i+SEQ_LEN])
+        Y.append(data[i+SEQ_LEN:i+SEQ_LEN+HORIZON,0])
+    return np.array(X), np.array(Y)
+
+X,Y = create_sequences(scaled)
+N = len(X)
+train_n,val_n = int(N*.7), int(N*.15)
+
+X_train,Y_train = X[:train_n],Y[:train_n]
+X_val,Y_val = X[train_n:train_n+val_n],Y[train_n:train_n+val_n]
+X_test,Y_test = X[train_n+val_n:],Y[train_n+val_n:]
+
+class TSDataset(Dataset):
+    def __init__(self,X,Y):
+        self.X=torch.tensor(X,dtype=torch.float32)
+        self.Y=torch.tensor(Y,dtype=torch.float32)
+    def __len__(self): return len(self.X)
+    def __getitem__(self,i): return self.X[i],self.Y[i]
+
+train_ds,val_ds,test_ds = TSDataset(X_train,Y_train),TSDataset(X_val,Y_val),TSDataset(X_test,Y_test)
+
+class BahdanauAttention(nn.Module):
+    def __init__(self,Eh,Dh):
+        super().__init__()
+        self.W1=nn.Linear(Eh,Dh)
+        self.W2=nn.Linear(Dh,Dh)
+        self.V=nn.Linear(Dh,1)
+    def forward(self,enc,dec):
+        e = self.V(torch.tanh(self.W1(enc)+self.W2(dec.unsqueeze(1)))).squeeze(-1)
+        w = torch.softmax(e,1)
+        ctx = torch.bmm(w.unsqueeze(1),enc).squeeze(1)
+        return ctx,w
+
+class AttentionLSTM(nn.Module):
+    def __init__(self,nf,Eh=64,Dh=64):
+        super().__init__()
+        self.enc=nn.LSTM(nf,Eh,batch_first=True)
+        self.fc=nn.Linear(Eh,Dh)
+        self.att=BahdanauAttention(Eh,Dh)
+        self.out=nn.Sequential(nn.Linear(Eh+nf,128),nn.ReLU(),nn.Linear(128,HORIZON))
+    def forward(self,x):
+        e,(h,_)=self.enc(x)
+        q=torch.tanh(self.fc(h[-1]))
+        c,a=self.att(e,q)
+        y=self.out(torch.cat([c,x[:,-1]],1))
+        return y,a
+
+class SimpleLSTM(nn.Module):
+    def __init__(self,nf,h=64):
+        super().__init__()
+        self.lstm=nn.LSTM(nf,h,batch_first=True)
+        self.fc=nn.Linear(h+nf,HORIZON)
+    def forward(self,x):
+        _,(h,_)=self.lstm(x)
+        return self.fc(torch.cat([h[-1],x[:,-1]],1))
+
+def rmse(a,b): return math.sqrt(mean_squared_error(a.flatten(),b.flatten()))
+def mase(y,p,train):
+    s=np.mean(np.abs(train[1:]-train[:-1]))
+    return np.mean(np.abs(y-p))/s
+def smape(a,b):
+    return 100*np.mean(2*np.abs(a-b)/(np.abs(a)+np.abs(b)))
+
+def invert(z):
+    return z*scaler.scale_[0]+scaler.mean_[0]
+
+def train_model(model,epochs=10):
+    opt=torch.optim.Adam(model.parameters(),1e-3)
+    loss_fn=nn.MSELoss()
+    for e in range(epochs):
+        model.train()
+        for xb,yb in train_loader:
+            opt.zero_grad()
+            loss=loss_fn(model(xb)[0] if isinstance(model(xb),tuple) else model(xb),yb)
+            loss.backward()
+            opt.step()
+    return model
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train_loader = DataLoader(train_ds,64,shuffle=True)
+test_loader = DataLoader(test_ds,64)
+attn = AttentionLSTM(X.shape[2]).to(device)
+lstm = SimpleLSTM(X.shape[2]).to(device)
+
+train_model(attn,8)
+train_model(lstm,8)
+def eval_model(model):
+    P=[]
+    with torch.no_grad():
+        for xb,_ in test_loader:
+            y = model(xb)
+            if isinstance(y,tuple): y=y[0]
+            P.append(y.numpy())
+    return np.vstack(P)
+
+pred_attn = invert(eval_model(attn))
+pred_lstm = invert(eval_model(lstm))
+true = invert(Y_test)
+naive=np.repeat(X_test[:,-1,0].reshape(-1,1),HORIZON,1)
+seasonal=np.tile(X_test[:,-24,0].reshape(-1,1),(1,HORIZON))
+naive,seasonal=invert(naive),invert(seasonal)
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    def arima_forecast(history):
+        return ARIMA(history,order=(5,1,0)).fit().forecast(24)
+    ar=np.vstack([arima_forecast(invert(x[:,0])) for x in X_test[:50]])
+    if len(ar)<len(X_test):
+        ar=np.vstack([ar,np.repeat(ar[-1][None],len(X_test)-len(ar),0)])
+except:
+    ar=None
+train_y = df["y"].values[:train_n]
+
+rows=[]
+def add(name,pred):
+    rows.append([name,rmse(true,pred),mase(true,pred,train_y),smape(true,pred)])
+
+add("Naive",naive)
+add("Seasonal-Naive",seasonal)
+add("Simple LSTM",pred_lstm)
+add("Attention LSTM",pred_attn)
+if ar is not None: add("ARIMA",ar)
+
+summary = pd.DataFrame(rows,columns=["Model","RMSE","MASE","sMAPE"])
+print(summary)
+summary.to_csv("final_results.csv",index=False)
+plt.figure(figsize=(8,3))
+plt.plot(true[0],label="True")
+plt.plot(pred_attn[0],label="Attention")
+plt.title("Forecast Example")
+plt.legend()
+plt.show()
